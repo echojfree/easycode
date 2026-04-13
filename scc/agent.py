@@ -47,6 +47,16 @@ from .types import (
 
 # 对应 Claude Code: MAX_TOOL_ITERATIONS（防死循环上限）
 MAX_ITERATIONS = 15
+TOOL_RESULT_COMPACT_MARKER = "[tool result compacted]"
+HISTORY_COMPACT_MARKER = "[context compacted]"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+        return value if value > 0 else default
+    except Exception:
+        return default
 
 # ─────────────────────────────────────────────────────────
 #  系统提示
@@ -102,6 +112,154 @@ class QueryEngine:
         # 当前的 ToolContext（每次 submit_message 时更新 messages）
         self._context = ToolContext(cwd=self.cwd, messages=self.messages)
 
+    def _estimate_message_size(self, msg: dict) -> int:
+        try:
+            return len(json.dumps(msg, ensure_ascii=False))
+        except Exception:
+            return len(str(msg))
+
+    def _shorten_text(self, text: str, head: int, tail: int) -> str:
+        if len(text) <= head + tail + 16:
+            return text
+        return f"{text[:head]}\n... (snipped) ...\n{text[-tail:]}"
+
+    def _apply_tool_result_budget(self) -> None:
+        """
+        Inspired by claudecode's applyToolResultBudget():
+        shrink oversized tool_result content before sending context to model.
+        """
+        max_chars = _env_int("SCC_MAX_TOOL_RESULT_CHARS", 12000)
+        head_chars = _env_int("SCC_TOOL_RESULT_HEAD_CHARS", 6000)
+        tail_chars = _env_int("SCC_TOOL_RESULT_TAIL_CHARS", 2000)
+        changed = False
+        new_messages: list[dict] = []
+
+        for msg in self.messages:
+            if msg.get("role") != "tool":
+                new_messages.append(msg)
+                continue
+
+            content = msg.get("content")
+            if not isinstance(content, str):
+                new_messages.append(msg)
+                continue
+            if content.startswith(TOOL_RESULT_COMPACT_MARKER):
+                new_messages.append(msg)
+                continue
+            if len(content) <= max_chars:
+                new_messages.append(msg)
+                continue
+
+            compacted = (
+                f"{TOOL_RESULT_COMPACT_MARKER} "
+                f"(original={len(content)} chars)\n"
+                f"{self._shorten_text(content, head_chars, tail_chars)}"
+            )
+            new_msg = dict(msg)
+            new_msg["content"] = compacted
+            new_messages.append(new_msg)
+            changed = True
+
+        if changed:
+            self.messages = new_messages
+            self._context.messages = self.messages
+
+    def _build_compaction_summary(self, dropped: list[dict]) -> str:
+        total_chars = sum(
+            len(m.get("content", ""))
+            for m in dropped
+            if isinstance(m.get("content"), str)
+        )
+        tool_results = sum(1 for m in dropped if m.get("role") == "tool")
+
+        user_points: list[str] = []
+        for m in dropped:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            text = " ".join(content.split())
+            if not text:
+                continue
+            user_points.append(f"- {text[:120]}")
+            if len(user_points) >= 4:
+                break
+
+        lines = [
+            f"{HISTORY_COMPACT_MARKER} {len(dropped)} messages archived "
+            f"(~{total_chars} chars, {tool_results} tool results).",
+            "Recent requests from earlier context:",
+        ]
+        if user_points:
+            lines.extend(user_points)
+        else:
+            lines.append("- (no user text available)")
+        return "\n".join(lines)
+
+    def _compact_history_if_needed(self, on_compact=None) -> None:
+        """
+        Inspired by claudecode's compact/reactive-compact layers:
+        keep recent turns and replace old prefix with a compact boundary summary.
+
+        on_compact(before: int, after: int) — optional callback fired when
+        compaction actually occurs.
+        """
+        if not self.messages:
+            return
+
+        max_chars = _env_int("SCC_MAX_CONTEXT_CHARS", 120000)
+        keep_last = _env_int("SCC_KEEP_LAST_MESSAGES", 24)
+        summary_reserve = _env_int("SCC_COMPACT_SUMMARY_RESERVE_CHARS", 2000)
+
+        current_chars = sum(self._estimate_message_size(m) for m in self.messages)
+        if current_chars <= max_chars:
+            return
+
+        before_count = len(self.messages)
+
+        target_suffix_budget = max(1000, max_chars - summary_reserve)
+        suffix_start = len(self.messages)
+        running = 0
+        min_suffix_start = max(0, len(self.messages) - keep_last)
+
+        for idx in range(len(self.messages) - 1, -1, -1):
+            running += self._estimate_message_size(self.messages[idx])
+            if idx < min_suffix_start and running > target_suffix_budget:
+                break
+            suffix_start = idx
+
+        suffix_start = min(suffix_start, min_suffix_start)
+        dropped = self.messages[:suffix_start]
+        kept = self.messages[suffix_start:]
+
+        # Never start a request payload with orphan tool messages.
+        while kept and kept[0].get("role") == "tool":
+            dropped.append(kept.pop(0))
+
+        if not dropped:
+            return
+        if not kept:
+            # Keep at least one non-tool message when possible.
+            for idx in range(len(self.messages) - 1, -1, -1):
+                if self.messages[idx].get("role") != "tool":
+                    kept = [self.messages[idx]]
+                    break
+            if not kept:
+                kept = [self.messages[-1]]
+
+        summary = self._build_compaction_summary(dropped)
+        self.messages = [make_assistant_msg(summary)] + kept
+        self._context.messages = self.messages
+
+        if on_compact:
+            on_compact(before_count, len(self.messages))
+
+    def _prepare_messages_for_query(self, on_compact=None) -> list[dict]:
+        self._apply_tool_result_budget()
+        self._compact_history_if_needed(on_compact=on_compact)
+        return self.messages
+
     # ── 主入口：处理一条用户消息 ────────────────────────────
     def submit_message(
         self,
@@ -111,6 +269,7 @@ class QueryEngine:
         on_llm_end: Optional[callable] = None,
         on_tool_call: Optional[callable] = None,
         on_tool_result: Optional[callable] = None,
+        on_compact: Optional[callable] = None,
     ) -> str:
         """
         处理用户输入，执行完整 Agent 循环，返回最终文本回复。
@@ -121,11 +280,12 @@ class QueryEngine:
         on_llm_end(had_tokens:bool) — LLM 流结束（隐藏 spinner）
         on_tool_call(tool, name, input) — 工具调用前（UI 展示）
         on_tool_result(tool, result)    — 工具执行后（UI 展示）
+        on_compact(before, after)   — 会话历史被压缩时触发（before/after 消息数）
         """
         self.messages.append(make_user_msg(user_input))
         self._context.messages = self.messages
         return self._query_loop(on_token, on_llm_start, on_llm_end,
-                                on_tool_call, on_tool_result)
+                                on_tool_call, on_tool_result, on_compact)
 
     # ── 核心 Agent 循环 ──────────────────────────────────────
     def _query_loop(
@@ -135,6 +295,7 @@ class QueryEngine:
         on_llm_end: Optional[callable],
         on_tool_call: Optional[callable],
         on_tool_result: Optional[callable],
+        on_compact: Optional[callable] = None,
     ) -> str:
         """
         对应 Claude Code: queryLoop() [while(true)]
@@ -148,11 +309,11 @@ class QueryEngine:
           6. 无 tool_calls   → 返回（Terminal state）
         """
         for iteration in range(1, MAX_ITERATIONS + 1):
-
             # ── 构造发给 LLM 的消息列表 ─────────────────────────
+            messages_for_query = self._prepare_messages_for_query(on_compact=on_compact)
             full_messages = [
                 make_system_msg(build_system_prompt(self.cwd))
-            ] + self.messages
+            ] + messages_for_query
 
             # ── 流式调用 LLM ──────────────────────────────────
             if on_llm_start:

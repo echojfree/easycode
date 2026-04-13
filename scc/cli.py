@@ -251,6 +251,9 @@ def repl(engine: QueryEngine) -> None:
             sys.stdout.write(c(token, GREEN))
             sys.stdout.flush()
 
+        def on_compact(before: int, after: int) -> None:
+            p(f"\n  ⟳ 会话压缩: {before} 条 → {after} 条 (上下文过长，已归档早期历史)", YELLOW)
+
         try:
             engine.submit_message(
                 user_input,
@@ -259,6 +262,7 @@ def repl(engine: QueryEngine) -> None:
                 on_llm_end=on_llm_end,
                 on_tool_call=_on_tool_call,
                 on_tool_result=_on_tool_result,
+                on_compact=on_compact,
             )
         except KeyboardInterrupt:
             spinner.stop()

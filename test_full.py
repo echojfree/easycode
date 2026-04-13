@@ -515,6 +515,205 @@ def test_queryengine_execute_builtin_bash():
     ok("test_queryengine_execute_builtin_bash")
 
 
+def test_queryengine_compacts_oversized_tool_result():
+    """Large tool_result content is compacted before model request."""
+    from scc.agent import QueryEngine, TOOL_RESULT_COMPACT_MARKER
+    from scc.types import make_user_msg, make_assistant_msg, make_tool_result_msg
+
+    class CaptureClient:
+        model = "test-model"
+        def __init__(self):
+            self.last_messages = None
+        def chat_stream(self, messages, tools=None):
+            self.last_messages = messages
+            yield {"role": "assistant", "content": "ok", "tool_calls": []}
+
+    old = os.environ.get("SCC_MAX_TOOL_RESULT_CHARS")
+    old_head = os.environ.get("SCC_TOOL_RESULT_HEAD_CHARS")
+    old_tail = os.environ.get("SCC_TOOL_RESULT_TAIL_CHARS")
+    os.environ["SCC_MAX_TOOL_RESULT_CHARS"] = "1500"
+    os.environ["SCC_TOOL_RESULT_HEAD_CHARS"] = "1000"
+    os.environ["SCC_TOOL_RESULT_TAIL_CHARS"] = "300"
+    try:
+        client = CaptureClient()
+        engine = QueryEngine(client=client)
+        engine.messages = [
+            make_user_msg("old prompt"),
+            make_assistant_msg("", tool_calls=[{
+                "id": "call_1",
+                "function": {"name": "bash", "arguments": "{}"},
+            }]),
+            make_tool_result_msg("call_1", "X" * 12000),
+        ]
+        engine._context.messages = engine.messages
+
+        out = engine.submit_message("new prompt")
+        assert out == "ok"
+        assert client.last_messages is not None
+
+        tool_msgs = [m for m in client.last_messages if m.get("role") == "tool"]
+        assert tool_msgs, "Expected tool messages in payload"
+        compacted = tool_msgs[-1].get("content", "")
+        assert isinstance(compacted, str)
+        assert compacted.startswith(TOOL_RESULT_COMPACT_MARKER), compacted[:120]
+        assert len(compacted) < 2000, f"Compacted payload still too large: {len(compacted)}"
+        ok("test_queryengine_compacts_oversized_tool_result")
+    finally:
+        if old is None:
+            os.environ.pop("SCC_MAX_TOOL_RESULT_CHARS", None)
+        else:
+            os.environ["SCC_MAX_TOOL_RESULT_CHARS"] = old
+        if old_head is None:
+            os.environ.pop("SCC_TOOL_RESULT_HEAD_CHARS", None)
+        else:
+            os.environ["SCC_TOOL_RESULT_HEAD_CHARS"] = old_head
+        if old_tail is None:
+            os.environ.pop("SCC_TOOL_RESULT_TAIL_CHARS", None)
+        else:
+            os.environ["SCC_TOOL_RESULT_TAIL_CHARS"] = old_tail
+
+
+def test_queryengine_compacts_history_when_context_too_large():
+    """History is compacted with a boundary summary and no orphan leading tool blocks."""
+    from scc.agent import QueryEngine, HISTORY_COMPACT_MARKER
+    from scc.types import make_user_msg, make_assistant_msg, make_tool_result_msg
+
+    class CaptureClient:
+        model = "test-model"
+        def __init__(self):
+            self.last_messages = None
+        def chat_stream(self, messages, tools=None):
+            self.last_messages = messages
+            yield {"role": "assistant", "content": "done", "tool_calls": []}
+
+    old_ctx = os.environ.get("SCC_MAX_CONTEXT_CHARS")
+    old_keep = os.environ.get("SCC_KEEP_LAST_MESSAGES")
+    old_tool = os.environ.get("SCC_MAX_TOOL_RESULT_CHARS")
+    os.environ["SCC_MAX_CONTEXT_CHARS"] = "3500"
+    os.environ["SCC_KEEP_LAST_MESSAGES"] = "6"
+    os.environ["SCC_MAX_TOOL_RESULT_CHARS"] = "2000"
+    try:
+        client = CaptureClient()
+        engine = QueryEngine(client=client)
+
+        seeded = []
+        for i in range(18):
+            seeded.append(make_user_msg(f"user message {i} " + ("u" * 140)))
+            seeded.append(make_assistant_msg(
+                f"assistant message {i} " + ("a" * 140),
+                tool_calls=[{
+                    "id": f"call_{i}",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            ))
+            seeded.append(make_tool_result_msg(f"call_{i}", "r" * 1800))
+
+        engine.messages = seeded
+        engine._context.messages = engine.messages
+        original_size = sum(len(json.dumps(m, ensure_ascii=False)) for m in engine.messages)
+
+        out = engine.submit_message("latest prompt")
+        assert out == "done"
+        assert client.last_messages is not None
+        payload_no_system = client.last_messages[1:]
+        payload_size = sum(len(json.dumps(m, ensure_ascii=False)) for m in payload_no_system)
+
+        assert payload_size < original_size, "Payload was not reduced"
+        assert payload_no_system, "Payload unexpectedly empty"
+        assert payload_no_system[0].get("role") != "tool", "Payload starts with orphan tool message"
+        assert any(
+            m.get("role") == "assistant"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith(HISTORY_COMPACT_MARKER)
+            for m in payload_no_system
+        ), "Compaction boundary summary not found"
+        ok("test_queryengine_compacts_history_when_context_too_large")
+    finally:
+        if old_ctx is None:
+            os.environ.pop("SCC_MAX_CONTEXT_CHARS", None)
+        else:
+            os.environ["SCC_MAX_CONTEXT_CHARS"] = old_ctx
+        if old_keep is None:
+            os.environ.pop("SCC_KEEP_LAST_MESSAGES", None)
+        else:
+            os.environ["SCC_KEEP_LAST_MESSAGES"] = old_keep
+        if old_tool is None:
+            os.environ.pop("SCC_MAX_TOOL_RESULT_CHARS", None)
+        else:
+            os.environ["SCC_MAX_TOOL_RESULT_CHARS"] = old_tool
+
+
+def test_queryengine_on_compact_callback_fired():
+    """on_compact callback is fired with (before, after) counts when history is compacted."""
+    from scc.agent import QueryEngine
+    from scc.types import make_user_msg, make_assistant_msg, make_tool_result_msg
+
+    class CaptureClient:
+        model = "test-model"
+        def chat_stream(self, messages, tools=None):
+            yield {"role": "assistant", "content": "ok", "tool_calls": []}
+
+    old_ctx = os.environ.get("SCC_MAX_CONTEXT_CHARS")
+    old_keep = os.environ.get("SCC_KEEP_LAST_MESSAGES")
+    old_tool = os.environ.get("SCC_MAX_TOOL_RESULT_CHARS")
+    os.environ["SCC_MAX_CONTEXT_CHARS"] = "3500"
+    os.environ["SCC_KEEP_LAST_MESSAGES"] = "6"
+    os.environ["SCC_MAX_TOOL_RESULT_CHARS"] = "2000"
+    try:
+        engine = QueryEngine(client=CaptureClient())
+
+        for i in range(15):
+            engine.messages.append(make_user_msg(f"user message {i} " + "u" * 150))
+            engine.messages.append(make_assistant_msg(f"assistant {i} " + "a" * 150))
+        engine._context.messages = engine.messages
+
+        compact_events = []
+        def on_compact(before: int, after: int) -> None:
+            compact_events.append((before, after))
+
+        engine.submit_message("trigger compaction", on_compact=on_compact)
+
+        assert compact_events, "on_compact callback was never called"
+        before, after = compact_events[0]
+        assert before > after, f"Expected before > after, got {before} > {after}"
+        ok("test_queryengine_on_compact_callback_fired")
+    finally:
+        if old_ctx is None:
+            os.environ.pop("SCC_MAX_CONTEXT_CHARS", None)
+        else:
+            os.environ["SCC_MAX_CONTEXT_CHARS"] = old_ctx
+        if old_keep is None:
+            os.environ.pop("SCC_KEEP_LAST_MESSAGES", None)
+        else:
+            os.environ["SCC_KEEP_LAST_MESSAGES"] = old_keep
+        if old_tool is None:
+            os.environ.pop("SCC_MAX_TOOL_RESULT_CHARS", None)
+        else:
+            os.environ["SCC_MAX_TOOL_RESULT_CHARS"] = old_tool
+
+
+def test_queryengine_on_compact_not_called_when_small():
+    """on_compact callback is NOT called when context is small enough."""
+    from scc.agent import QueryEngine
+    from scc.types import make_user_msg, make_assistant_msg
+
+    class CaptureClient:
+        model = "test-model"
+        def chat_stream(self, messages, tools=None):
+            yield {"role": "assistant", "content": "ok", "tool_calls": []}
+
+    engine = QueryEngine(client=CaptureClient())
+    engine.messages.append(make_user_msg("short"))
+    engine.messages.append(make_assistant_msg("reply"))
+    engine._context.messages = engine.messages
+
+    compact_events = []
+    engine.submit_message("small context", on_compact=lambda b, a: compact_events.append((b, a)))
+
+    assert not compact_events, f"on_compact should not fire for small context, got {compact_events}"
+    ok("test_queryengine_on_compact_not_called_when_small")
+
+
 # ═══════════════════════════════════════════════════════════════
 #  5. Integration: load_mcp_servers → QueryEngine → tool call
 # ═══════════════════════════════════════════════════════════════
@@ -672,6 +871,10 @@ if __name__ == "__main__":
     test_queryengine_extra_tools_in_schemas()
     test_queryengine_execute_tool_unknown()
     test_queryengine_execute_builtin_bash()
+    test_queryengine_compacts_oversized_tool_result()
+    test_queryengine_compacts_history_when_context_too_large()
+    test_queryengine_on_compact_callback_fired()
+    test_queryengine_on_compact_not_called_when_small()
 
     # Section 5
     test_integration_mcp_tool_execution()
