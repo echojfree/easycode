@@ -15,9 +15,33 @@ Web server — FastAPI + SSE
 """
 from __future__ import annotations
 import json
+import os
+import pathlib
 import queue
 import threading
 from typing import Generator
+
+
+def _load_dotenv_override() -> None:
+    """Load .env file, overriding any existing env vars.
+
+    Unlike main.py's _load_dotenv() (which skips already-set vars),
+    this version forces .env values so the shell environment cannot
+    accidentally override Ollama connection settings.
+    """
+    env_file = pathlib.Path(__file__).parent / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ[key.strip()] = val.strip()
+
+
+# Must run before any scc.api import so OLLAMA_HOST etc. are correct
+_load_dotenv_override()
 
 import uvicorn
 from fastapi import FastAPI
