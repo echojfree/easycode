@@ -44,10 +44,13 @@ def _load_dotenv_override() -> None:
 _load_dotenv_override()
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+UPLOAD_DIR = pathlib.Path(__file__).parent / "upload"
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 from scc.agent import QueryEngine
 from scc.api import OllamaClient, OLLAMA_HOST, OLLAMA_PORT, MODEL as OLLAMA_MODEL
@@ -151,6 +154,23 @@ def list_providers():
     })
 
     return {"providers": result, "current": PROVIDER}
+
+
+# ── /api/upload ──────────────────────────────────────────────
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """接收文件并保存到本地 upload/ 目录。"""
+    safe_name = pathlib.Path(file.filename).name  # 去掉路径穿越
+    dest = UPLOAD_DIR / safe_name
+    # 同名文件加序号
+    stem, suffix = dest.stem, dest.suffix
+    counter = 1
+    while dest.exists():
+        dest = UPLOAD_DIR / f"{stem}_{counter}{suffix}"
+        counter += 1
+    content = await file.read()
+    dest.write_bytes(content)
+    return {"filename": dest.name, "path": f"upload/{dest.name}", "size": len(content)}
 
 
 # ── /api/clear ───────────────────────────────────────────────
