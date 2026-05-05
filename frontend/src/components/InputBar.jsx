@@ -1,6 +1,9 @@
 import { useState } from 'react'
 
-export default function InputBar({ onSend, isStreaming }) {
+export default function InputBar({ onSend, isStreaming, providerInfo }) {
+  const providerLabel = providerInfo?.provider === 'openai'
+    ? (providerInfo.model || 'OpenAI')
+    : 'Ollama'
   const [input, setInput] = useState('')
 
   const handleSubmit = (e) => {
@@ -49,7 +52,7 @@ export default function InputBar({ onSend, isStreaming }) {
           {/* 右侧：model 选择器 + 发送 */}
           <div className="flex items-center gap-2 flex-shrink-0 self-end mb-0.5">
             <span className="text-xs text-muted hidden sm:block">
-              Ollama <span className="text-muted-soft">∨</span>
+              {providerLabel} <span className="text-muted-soft">∨</span>
             </span>
             <button
               onClick={handleSubmit}

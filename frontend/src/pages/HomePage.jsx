@@ -8,7 +8,10 @@ const PILLS = [
   { icon: '✦',  label: '随便聊' },
 ]
 
-export default function HomePage({ onSend }) {
+export default function HomePage({ onSend, providerInfo }) {
+  const providerLabel = providerInfo?.provider === 'openai'
+    ? (providerInfo.model || 'OpenAI')
+    : 'Ollama'
   const [input, setInput] = useState('')
 
   const handleSubmit = (e) => {
@@ -64,7 +67,7 @@ export default function HomePage({ onSend }) {
             </button>
             <div className="flex items-center gap-3">
               <span className="text-xs text-muted flex items-center gap-1">
-                Ollama <span className="text-muted-soft">∨</span>
+                {providerLabel} <span className="text-muted-soft">∨</span>
               </span>
               <button
                 type="submit"

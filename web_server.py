@@ -50,12 +50,23 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from scc.agent import QueryEngine
-from scc.api import OllamaClient, OLLAMA_HOST, OLLAMA_PORT, MODEL
+from scc.api import OllamaClient, OLLAMA_HOST, OLLAMA_PORT, MODEL as OLLAMA_MODEL
+from scc.openai_client import OpenAIClient, OPENAI_BASE_URL, OPENAI_MODEL
+from scc.embedding_client import EmbeddingClient
 from scc.mcp import load_mcp_servers
+
+# ── Provider 选择 ────────────────────────────────────────────
+PROVIDER = os.environ.get("PROVIDER", "ollama").lower()
+
+def _build_client():
+    if PROVIDER == "openai":
+        return OpenAIClient()
+    return OllamaClient()
 
 # ── 全局 engine（单用户本地应用，共享实例） ──────────────────
 _mcp_tools, _mcp_clients = load_mcp_servers(".")
-_client = OllamaClient()
+_client = _build_client()
+_embed_client = EmbeddingClient()
 engine = QueryEngine(client=_client, extra_tools=_mcp_tools)
 _engine_lock = threading.Lock()   # 防止并发请求同时修改 messages
 
@@ -79,13 +90,67 @@ class ChatRequest(BaseModel):
 @app.get("/api/health")
 def health():
     ok, models = _client.ping()
+    if PROVIDER == "openai":
+        host = OPENAI_BASE_URL
+        model = OPENAI_MODEL
+    else:
+        host = f"{OLLAMA_HOST}:{OLLAMA_PORT}"
+        model = OLLAMA_MODEL
     return {
-        "status": "ok",
-        "model": MODEL,
-        "host": f"{OLLAMA_HOST}:{OLLAMA_PORT}",
-        "ollama_reachable": ok,
+        "status":           "ok",
+        "provider":         PROVIDER,
+        "model":            model,
+        "host":             host,
+        "llm_reachable":    ok,
         "available_models": models,
     }
+
+
+# ── /api/providers ────────────────────────────────────────────
+@app.get("/api/providers")
+def list_providers():
+    """列出可用的 provider 配置及连通性状态。"""
+    result = []
+
+    # Ollama
+    ollama = OllamaClient()
+    ok_o, models_o = ollama.ping()
+    result.append({
+        "id":      "ollama",
+        "label":   f"Ollama ({OLLAMA_MODEL})",
+        "model":   OLLAMA_MODEL,
+        "host":    f"{OLLAMA_HOST}:{OLLAMA_PORT}",
+        "active":  PROVIDER == "ollama",
+        "ok":      ok_o,
+        "models":  models_o[:10],          # 只返回前 10 个
+    })
+
+    # OpenAI-compatible
+    openai_cli = OpenAIClient()
+    ok_ai, models_ai = openai_cli.ping()
+    result.append({
+        "id":      "openai",
+        "label":   f"OpenAI-compatible ({OPENAI_MODEL})",
+        "model":   OPENAI_MODEL,
+        "host":    OPENAI_BASE_URL,
+        "active":  PROVIDER == "openai",
+        "ok":      ok_ai,
+        "models":  models_ai[:10],
+    })
+
+    # Embedding
+    ok_emb, emb_size = _embed_client.ping()
+    result.append({
+        "id":      "embedding",
+        "label":   f"Embedding ({os.environ.get('EMBEDDING_MODEL', '')})",
+        "model":   os.environ.get("EMBEDDING_MODEL", ""),
+        "host":    os.environ.get("EMBEDDING_BASE_URL", ""),
+        "active":  False,
+        "ok":      ok_emb,
+        "dim":     emb_size,
+    })
+
+    return {"providers": result, "current": PROVIDER}
 
 
 # ── /api/clear ───────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import MessageList from '../components/MessageList'
 import InputBar from '../components/InputBar'
 
-export default function ChatPage({ messages, isStreaming, onSend, onClear }) {
+export default function ChatPage({ messages, isStreaming, onSend, onClear, providerInfo }) {
   // 第一条用户消息作为标题
   const firstUserMsg = messages.find(m => m.role === 'user')
   const title = firstUserMsg
@@ -37,7 +37,7 @@ export default function ChatPage({ messages, isStreaming, onSend, onClear }) {
 
       {/* 底部输入区 */}
       <footer className="flex-shrink-0 border-t border-hairline bg-canvas">
-        <InputBar onSend={onSend} isStreaming={isStreaming} />
+        <InputBar onSend={onSend} isStreaming={isStreaming} providerInfo={providerInfo} />
       </footer>
     </div>
   )
