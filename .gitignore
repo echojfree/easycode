@@ -20,8 +20,9 @@ env/
 claudecode/
 claudecode.zip
 
-# 模型生成的测试输出文件
+# 模型生成的测试输出文件（排除前端入口）
 *.html
+!frontend/index.html
 
 # 分发包
 dist/
