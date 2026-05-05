@@ -28,3 +28,6 @@ claudecode.zip
 dist/
 build/
 *.egg-info/
+
+# Node.js
+frontend/node_modules/
